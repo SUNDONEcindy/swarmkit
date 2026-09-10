@@ -63,9 +63,15 @@ jobs:
           echo "node=${{ github.repository }} assigned_slot=$SLOT current_slot=$CURSLOT"
 
       - name: Run HEAD uptime probe
-        if: env.FORCE == 'true' || steps.slot.outputs.slot == steps.slot.outputs.curslot || github.event_name == 'repository_dispatch'
+        # 修正 (2026-09-10, 缺陷自查):
+        #   旧版用 "slot == 当前分钟槽" 作为"本节点本轮是否拨测"的闸门。
+        #   与 */30 调度叠加后, 每个 30 分钟窗口只有 2 个槽位会被覆盖,
+        #   单节点定时拨测覆盖率约 2/30 ≈ 6.7% -> 绝大多数节点定时轮次空转。
+        # 现改为: 每个节点每轮都拨测, 仅用 sleep 做打散(最大 116 秒),
+        #   保证 187 节点不形成洪峰, 同时保证每节点每 30 分钟都有真实产出。
         run: |
           set -u
+          sleep $(( ${{ steps.slot.outputs.slot }} * 4 ))
           mkdir -p traffic_events
           TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -148,14 +154,14 @@ jobs:
           H1="Authorization: token ${GH_TOKEN}"
           H2="Accept: application/vnd.github+json"
 
-          # 本轮若因错峰未执行拨测, 则无产物, 属正常跳过而非失败
           STAMP=$(date -u +%Y%m%dT%H%M%SZ)
           FILE="traffic_events/${STAMP}.json"
           if [ ! -f "$FILE" ]; then
             LATEST=$(ls -1t traffic_events/*.json 2>/dev/null | head -1 || true)
             if [ -z "$LATEST" ]; then
-              echo "SKIP_NO_PROBE_OUTPUT (本轮错峰未拨测, 无产物)"
-              exit 0
+              # 拨测步骤每轮必跑, 走到这里即真实失败, 不允许静默跳过粉饰为绿
+              echo "PERSIST_FAIL no_probe_output"
+              exit 1
             fi
             FILE="$LATEST"
           fi
