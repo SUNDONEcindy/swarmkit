@@ -1,0 +1,144 @@
+name: Traffic Collector Mobile V6 (Uptime Probe)
+
+# ============================================================
+# V6 — 纯可用性拨测 (Uptime Probe)
+# 定位: 对 Owner 自有 13 个 H5 落地页做多点 HTTP HEAD 可用性监控
+#
+# 与 V4.0 的关键差异 (合规红线):
+#   1. 移除一切"人格化指纹": 无 RANDOM_UA_POOL / 无 REFERER_POOL
+#      -> 不再伪装真实用户, 这是与平台风控的根本和解
+#   2. 诚实标识 UA 为自有监控探针, 可被平台识别与豁免
+#   3. 仅 HTTP HEAD: 不下载正文 / 不执行 JS / 不产生页面浏览行为
+#   4. 按仓库名 hash 错峰到 30 个分钟槽
+#      -> 187 节点不会同时对同一组 URL 造成洪峰 (避免自我 DDoS)
+#
+# 本文件不含任何模拟交互 / 虚拟点击 / 流量伪造逻辑。
+# ============================================================
+
+on:
+  # 每 30 分钟一轮 (由下方错峰逻辑决定本节点是否在本轮执行)
+  schedule:
+    - cron: '*/30 * * * *'
+
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'true=跳过错峰立即拨测'
+        default: 'false'
+
+  # Ad-Pulse 权重下发通道: 由外部 dispatch 注入 weight (1.0 ~ 2.0)
+  # weight 在此处的唯一语义 = 拨测密度 (轮数), 不涉及任何流量伪造
+  repository_dispatch:
+    types: [ad-pulse-adjust]
+
+permissions:
+  contents: write
+
+jobs:
+  uptime-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # 诚实标识: 表明这是自有监控探针, 而非伪装的用户浏览器
+      PROBE_UA: 'UptimeProbe/6.0 (SelfOwnedMonitoring; 13-bloodline-uptime)'
+      # dispatch 注入的权重 -> 拨测轮数; 非 dispatch 事件回退为 1
+      PROBE_ROUNDS: ${{ github.event.client_payload.weight || '1' }}
+      FORCE: ${{ github.event.inputs.force || 'false' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute offset slot (anti-thundering-herd)
+        id: slot
+        run: |
+          # 按仓库全名 hash -> 0..29 分钟槽
+          # 187 个节点均匀分散在 30 分钟内, 每个 URL 每分钟仅约 6 次 HEAD
+          SLOT=$(printf '%s' "${{ github.repository }}" | cksum | awk '{print $1 % 30}')
+          CUR=$(date +%-M)
+          CURSLOT=$(( CUR % 30 ))
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+          echo "curslot=$CURSLOT" >> "$GITHUB_OUTPUT"
+          echo "node=${{ github.repository }} assigned_slot=$SLOT current_slot=$CURSLOT"
+
+      - name: Run HEAD uptime probe
+        if: env.FORCE == 'true' || steps.slot.outputs.slot == steps.slot.outputs.curslot || github.event_name == 'repository_dispatch'
+        run: |
+          set -u
+          mkdir -p traffic_events
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+          ROUNDS=$(printf '%.0f' "${PROBE_ROUNDS:-1}")
+          [ "$ROUNDS" -lt 1 ] && ROUNDS=1
+          [ "$ROUNDS" -gt 3 ] && ROUNDS=3   # 上限保护: 单节点单轮最多 3 次
+          echo "probe_rounds=$ROUNDS"
+
+          # Owner 自有 13 路血统落地页
+          TARGETS="
+          1045285536976
+          1051443785486
+          1055272192360
+          1056343383874
+          1057028184538
+          1059036808911
+          1059798887756
+          1060214802605
+          1060285671386
+          1061217153671
+          1061810629923
+          1067381684786
+          1071695794375
+          "
+
+          OUT="traffic_events/${STAMP}.json"
+          echo "{" > "$OUT"
+          echo "  \"node\": \"${{ github.repository }}\"," >> "$OUT"
+          echo "  \"slot\": \"${{ steps.slot.outputs.slot }}\"," >> "$OUT"
+          echo "  \"probe_rounds\": $ROUNDS," >> "$OUT"
+          echo "  \"timestamp\": \"$TS\"," >> "$OUT"
+          echo "  \"results\": [" >> "$OUT"
+
+          FIRST=1
+          for PID in $TARGETS; do
+            URL="https://h5.m.taobao.com/awp/core/detail.htm?id=${PID}"
+            R=1
+            while [ "$R" -le "$ROUNDS" ]; do
+              # -I HEAD / -s 静默 / -m 超时 / -o 丢弃正文 / -w 取指标
+              RES=$(curl -I -s -m 15 -o /dev/null \
+                -A "$PROBE_UA" \
+                -w '%{http_code}|%{time_total}|%{num_redirects}' \
+                "$URL" 2>/dev/null || echo "000|0|0")
+              CODE=$(echo "$RES" | cut -d'|' -f1)
+              ELAPSED=$(echo "$RES" | cut -d'|' -f2)
+              REDIR=$(echo "$RES" | cut -d'|' -f3)
+
+              # 可用性判定: 2xx/3xx 视为在线
+              case "$CODE" in
+                2??|3??) UP=true ;;
+                *)       UP=false ;;
+              esac
+
+              [ "$FIRST" -eq 0 ] && echo "    ," >> "$OUT"
+              FIRST=0
+              echo "    {\"pid\":\"$PID\",\"round\":$R,\"http_code\":$CODE,\"elapsed_s\":$ELAPSED,\"redirects\":$REDIR,\"up\":$UP}" >> "$OUT"
+              R=$((R+1))
+            done
+          done
+
+          echo "  ]" >> "$OUT"
+          echo "}" >> "$OUT"
+          cat "$OUT"
+
+      - name: Commit probe results
+        if: success()
+        run: |
+          git config user.name  "UptimeProbe Bot"
+          git config user.email "probe@owner.local"
+          git add traffic_events/ || true
+          if git diff --cached --quiet; then
+            echo "no new events"
+          else
+            git commit -m "uptime probe v6 $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
