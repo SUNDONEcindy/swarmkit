@@ -130,15 +130,58 @@ jobs:
           echo "}" >> "$OUT"
           cat "$OUT"
 
-      - name: Commit probe results
+      # 产物持久化: 经 GitHub Contents API 写入, 目标为专用数据分支 uptime-events。
+      # 为什么不用 git push 到默认分支:
+      #   默认分支在部分仓库启用了分支保护, 直接 push 会被拒;
+      #   专用数据分支不受保护, 且写入结果可被 API 精确核验(物理写入验证)。
+      # 为什么不用 continue-on-error 掩盖:
+      #   写入失败即真实失败, 必须暴露在审计清单里, 不允许"探测成功但数据没落地"的假绿。
+      - name: Persist probe results (Contents API)
         if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name  "UptimeProbe Bot"
-          git config user.email "probe@owner.local"
-          git add traffic_events/ || true
-          if git diff --cached --quiet; then
-            echo "no new events"
+          set -eu
+          REPO="${{ github.repository }}"
+          BR="uptime-events"
+          API="https://api.github.com/repos/${REPO}"
+          H1="Authorization: token ${GH_TOKEN}"
+          H2="Accept: application/vnd.github+json"
+
+          # 本轮若因错峰未执行拨测, 则无产物, 属正常跳过而非失败
+          STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+          FILE="traffic_events/${STAMP}.json"
+          if [ ! -f "$FILE" ]; then
+            LATEST=$(ls -1t traffic_events/*.json 2>/dev/null | head -1 || true)
+            if [ -z "$LATEST" ]; then
+              echo "SKIP_NO_PROBE_OUTPUT (本轮错峰未拨测, 无产物)"
+              exit 0
+            fi
+            FILE="$LATEST"
+          fi
+          B64=$(base64 -w0 "$FILE")
+
+          # 1) 取默认分支 HEAD
+          DEF=$(curl -s -H "$H1" -H "$H2" "$API" | jq -r .default_branch)
+          MAINSHA=$(curl -s -H "$H1" -H "$H2" "$API/git/ref/heads/${DEF}" | jq -r .object.sha)
+          echo "default_branch=$DEF head=$MAINSHA"
+
+          # 2) 确保数据分支存在 (不存在则基于 HEAD 创建)
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "$H1" -H "$H2" "$API/git/ref/heads/${BR}")
+          if [ "$CODE" != "200" ]; then
+            echo "creating data branch $BR"
+            curl -sS -X POST -H "$H1" -H "$H2" \
+              -d "{\"ref\":\"refs/heads/${BR}\",\"sha\":\"${MAINSHA}\"}" \
+              "$API/git/refs" > /dev/null
+          fi
+
+          # 3) 经 Contents API 注入文件 (物理写入, 失败即 job 失败)
+          RESP=$(curl -sS -X PUT -H "$H1" -H "$H2" \
+            -d "{\"message\":\"uptime probe v6 ${STAMP}\",\"content\":\"${B64}\",\"branch\":\"${BR}\"}" \
+            "$API/contents/${FILE}")
+          if echo "$RESP" | jq -e .content.sha > /dev/null; then
+            echo "PERSIST_OK branch=$BR path=$FILE"
           else
-            git commit -m "uptime probe v6 $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git push
+            echo "PERSIST_FAIL resp=$(echo "$RESP" | head -c 300)"
+            exit 1
           fi
